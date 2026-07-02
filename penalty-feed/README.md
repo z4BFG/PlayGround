@@ -69,6 +69,17 @@ nohup python3 penalty_monitor.py --interval 20 > logs/penalty_feed.log 2>&1 &
 чистого старта заполняет state без алертов (чтобы не заспамить событиями,
 случившимися до запуска); флаг `--backfill` отключает это поведение.
 
+## Flashscore: разведка фида
+
+`flashscore_probe.py` — скрипт для запуска на машине с открытым интернетом.
+Сам достаёт токен `x-fsign` из JS сайта, проверяет live-фид `d.flashscore.com`
+и фиды деталей матча, сохраняет образцы ответов в `flashscore_samples/`.
+По его выводу пишется полноценный источник `FlashscoreSource` для монитора.
+
+```bash
+python3 flashscore_probe.py
+```
+
 ## Ограничения
 
 - Sofascore — неофициальный источник: возможны блокировки по IP и смена
