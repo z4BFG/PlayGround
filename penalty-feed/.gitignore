@@ -3,3 +3,4 @@ __pycache__/
 penalty_state.json
 penalties.jsonl
 flashscore_samples/
+logs/
