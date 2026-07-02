@@ -26,14 +26,28 @@ import time
 
 import requests
 
+try:
+    from curl_cffi import requests as cf_requests
+    HAVE_CURL_CFFI = True
+except ImportError:
+    cf_requests = None
+    HAVE_CURL_CFFI = False
+
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 KNOWN_FSIGN = "SW9D1eZo"  # многолетняя константа, может смениться
 BASE_SITE = "https://www.flashscore.com"
-BASE_FEED = "https://d.flashscore.com/x/feed"
+# с 2026 фид проверяет TLS-отпечаток Chrome — без curl_cffi может отдавать 403
+FEED_HOSTS = [
+    "https://d.flashscore.com/x/feed",
+    "https://local-ruua.flashscore.ninja/46/x/feed",
+]
 OUT_DIR = "flashscore_samples"
 
-session = requests.Session()
+if HAVE_CURL_CFFI:
+    session = cf_requests.Session(impersonate="chrome")
+else:
+    session = requests.Session()
 session.headers.update({"User-Agent": UA, "Referer": BASE_SITE + "/"})
 
 
@@ -106,8 +120,11 @@ def parse_feed(text):
     return rows
 
 
+WORKING_HOST = [FEED_HOSTS[0]]  # обновляется после успешного live-фида
+
+
 def try_live_feeds(fsign):
-    """Пробуем варианты live-фида футбола."""
+    """Пробуем варианты live-фида футбола на всех известных хостах."""
     headers = {"x-fsign": fsign}
     variants = [
         "f_1_0_1_en_1",   # футбол, сегодня
@@ -115,13 +132,16 @@ def try_live_feeds(fsign):
         "f_1_0_1_ru_1",   # русская локаль
         "f_1_-1_1_en_1",  # вчера
     ]
-    for v in variants:
-        resp = get(f"{BASE_FEED}/{v}", headers=headers, label=f"live-фид {v} (fsign={fsign})")
-        if resp is not None and resp.status_code == 200 and len(resp.content) > 100:
-            save(f"live_{v}_{fsign}.txt", resp.text,
-                 {"url": resp.url, "fsign": fsign, "status": resp.status_code})
-            return v, resp.text
-        time.sleep(0.4)
+    for host in FEED_HOSTS:
+        for v in variants:
+            resp = get(f"{host}/{v}", headers=headers,
+                       label=f"live-фид {v} (fsign={fsign}, {host.split('/')[2]})")
+            if resp is not None and resp.status_code == 200 and len(resp.content) > 100:
+                save(f"live_{v}_{fsign}.txt", resp.text,
+                     {"url": resp.url, "fsign": fsign, "status": resp.status_code})
+                WORKING_HOST[0] = host
+                return v, resp.text
+            time.sleep(0.4)
     return None, None
 
 
@@ -137,7 +157,7 @@ def try_match_feeds(fsign, match_id):
     ]
     ok = []
     for p in patterns:
-        resp = get(f"{BASE_FEED}/{p}", headers=headers, label=f"матч-фид {p}")
+        resp = get(f"{WORKING_HOST[0]}/{p}", headers=headers, label=f"матч-фид {p}")
         if resp is not None and resp.status_code == 200 and len(resp.content) > 20:
             save(f"match_{p}.txt", resp.text, {"url": resp.url, "fsign": fsign})
             ok.append(p)
@@ -149,7 +169,8 @@ def try_match_feeds(fsign, match_id):
 
 
 def main():
-    print("=== Разведка фида Flashscore ===\n")
+    print("=== Разведка фида Flashscore ===")
+    print(f"TLS-имитация Chrome: {'да (curl_cffi)' if HAVE_CURL_CFFI else 'НЕТ — если будут 403, выполните: pip install curl_cffi'}\n")
 
     print("[1/4] Ищу токен x-fsign на сайте...")
     found = find_fsign()

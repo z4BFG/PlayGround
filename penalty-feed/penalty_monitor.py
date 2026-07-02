@@ -5,17 +5,21 @@
 VAR-проверка / серия пенальти) сразу, как только событие появляется в фиде.
 
 Источники:
+  espn         — неофициальный публичный API ESPN, бесплатно, без ключа,
+                 без анти-бот защиты. Лиги настраиваются (--espn-leagues).
   sofascore    — неофициальный API Sofascore, бесплатно, без ключа.
-                 Может отдавать 403 с датацентровых IP — тогда используйте api-football.
-  api-football — официальный API (api-sports.io), нужен ключ в API_FOOTBALL_KEY.
-                 Один запрос /fixtures?live=all на цикл покрывает все live-матчи.
+                 С 2025-26 отсеивает клиентов по TLS-отпечатку — нужен
+                 curl_cffi (pip install curl_cffi), тогда запросы выглядят
+                 как настоящий Chrome.
+  api-football — официальный API (api-sports.io), ключ в API_FOOTBALL_KEY.
+                 На Free-плане текущие сезоны недоступны (только 2021-2023).
 
 Алерты: stdout, JSONL-файл, опционально Telegram и произвольный webhook.
 
 Примеры:
-    python3 penalty_monitor.py --source sofascore --interval 20
+    python3 penalty_monitor.py                     # auto: espn → sofascore → api-football
+    python3 penalty_monitor.py --source espn --espn-leagues fifa.world,eng.2
     API_FOOTBALL_KEY=xxx python3 penalty_monitor.py --source api-football
-    python3 penalty_monitor.py --once          # один проход, для проверки доступности
 
 Переменные окружения:
     API_FOOTBALL_KEY      ключ api-sports.io (для --source api-football)
@@ -34,8 +38,27 @@ from datetime import datetime, timezone
 
 import requests
 
+try:
+    from curl_cffi import requests as cf_requests
+    HAVE_CURL_CFFI = True
+except ImportError:
+    cf_requests = None
+    HAVE_CURL_CFFI = False
+
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+# Сетевые исключения обоих HTTP-клиентов
+_net_errors = [requests.RequestException]
+if HAVE_CURL_CFFI:
+    for mod_name, cls_name in (("curl_cffi.requests.exceptions", "RequestException"),
+                               ("curl_cffi.requests.errors", "RequestsError"),
+                               ("curl_cffi", "CurlError")):
+        try:
+            _net_errors.append(getattr(__import__(mod_name, fromlist=[cls_name]), cls_name))
+        except (ImportError, AttributeError):
+            pass
+NET_ERRORS = tuple(_net_errors)
 
 RU_LABELS = {
     "penalty_goal": "⚽ ГОЛ С ПЕНАЛЬТИ",
@@ -45,6 +68,17 @@ RU_LABELS = {
     "penalty_awarded": "🟡 НАЗНАЧЕН ПЕНАЛЬТИ",
     "penalty_cancelled": "🚫 ПЕНАЛЬТИ ОТМЕНЁН",
 }
+
+
+def make_session():
+    """Сессия с TLS-отпечатком Chrome, если установлен curl_cffi.
+
+    Sofascore и Flashscore отсеивают не-браузерных клиентов по отпечатку
+    TLS-соединения — обычному requests они отвечают 403.
+    """
+    if HAVE_CURL_CFFI:
+        return cf_requests.Session(impersonate="chrome")
+    return requests.Session()
 
 
 def now_iso():
@@ -79,8 +113,9 @@ class PenaltyEvent:
 
     def format_ru(self):
         parts = [RU_LABELS.get(self.kind, self.kind)]
-        if self.minute:
-            parts.append(f"{self.minute}'")
+        minute = str(self.minute or "").rstrip("'")
+        if minute:
+            parts.append(f"{minute}'")
         parts.append(self.match)
         if self.team:
             parts.append(f"({self.team})")
@@ -91,8 +126,77 @@ class PenaltyEvent:
         return " ".join(parts)
 
 
+class ESPNSource:
+    """Неофициальный публичный API ESPN — без ключа и анти-бот защиты.
+
+    В деталях матча есть явный флаг penaltyKick. Лиги: fifa.world,
+    eng.1 (АПЛ), eng.2 (Championship), eng.3 (League One), eng.4 (League Two),
+    uefa.champions и т.д.
+    """
+
+    name = "espn"
+    BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+    DEFAULT_LEAGUES = ["fifa.world", "eng.1", "eng.2", "eng.3", "eng.4"]
+
+    def __init__(self, session, leagues=None):
+        self.session = session
+        self.leagues = leagues or list(self.DEFAULT_LEAGUES)
+
+    def check(self):
+        resp = self.session.get(f"{self.BASE}/{self.leagues[0]}/scoreboard",
+                                headers={"User-Agent": UA}, timeout=15)
+        resp.raise_for_status()
+
+    def poll(self):
+        results = []
+        for league in self.leagues:
+            try:
+                resp = self.session.get(f"{self.BASE}/{league}/scoreboard",
+                                        headers={"User-Agent": UA}, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            except NET_ERRORS + (ValueError,):
+                continue
+            league_name = (data.get("leagues") or [{}])[0].get("name", league)
+            for ev in data.get("events", []):
+                comp = (ev.get("competitions") or [{}])[0]
+                names, by_team_id = {}, {}
+                for c in comp.get("competitors", []):
+                    team_name = (c.get("team") or {}).get("displayName", "?")
+                    names[c.get("homeAway", "")] = team_name
+                    by_team_id[str((c.get("team") or {}).get("id"))] = team_name
+                match = "{} — {}".format(names.get("home", "?"), names.get("away", "?"))
+                for d in comp.get("details", []):
+                    kind = self._classify(d)
+                    if not kind:
+                        continue
+                    athletes = d.get("athletesInvolved") or []
+                    player = athletes[0].get("displayName", "") if athletes else ""
+                    minute = (d.get("clock") or {}).get("displayValue", "")
+                    key = "es:{}:{}:{}:{}".format(
+                        ev.get("id"), (d.get("type") or {}).get("id"), minute, player)
+                    results.append(PenaltyEvent(
+                        key=key, kind=kind, competition=league_name, match=match,
+                        minute=minute, team=by_team_id.get(str((d.get("team") or {}).get("id")), ""),
+                        player=player, source=self.name, raw=d))
+        return results
+
+    @staticmethod
+    def _classify(d):
+        text = ((d.get("type") or {}).get("text") or "").lower()
+        if not (d.get("penaltyKick") or "penalty" in text):
+            return None
+        if "shootout" in text:
+            return "penalty_shootout"
+        if d.get("scoringPlay") or "scored" in text:
+            return "penalty_goal"
+        if "missed" in text or "saved" in text:
+            return "penalty_missed"
+        return "penalty_awarded"
+
+
 class SofascoreSource:
-    """Неофициальный API Sofascore. Бесплатно, без ключа, но без гарантий."""
+    """Неофициальный API Sofascore. Бесплатно, но требует curl_cffi (TLS)."""
 
     name = "sofascore"
     BASE = "https://api.sofascore.com/api/v1"
@@ -107,6 +211,9 @@ class SofascoreSource:
         resp.raise_for_status()
         return resp.json()
 
+    def check(self):
+        self._get("/sport/football/events/live")
+
     def poll(self):
         events = self._get("/sport/football/events/live").get("events", [])[: self.max_events]
         results = []
@@ -119,7 +226,7 @@ class SofascoreSource:
             competition = ev.get("tournament", {}).get("name", "")
             try:
                 incidents = self._get(f"/event/{ev_id}/incidents").get("incidents", [])
-            except requests.RequestException:
+            except NET_ERRORS:
                 continue
             for inc in incidents:
                 kind = self._classify(inc)
@@ -174,6 +281,12 @@ class ApiFootballSource:
     def __init__(self, session, api_key):
         self.session = session
         self.api_key = api_key
+
+    def check(self):
+        resp = self.session.get(self.BASE + "/status",
+                                headers={"x-apisports-key": self.api_key, "User-Agent": UA},
+                                timeout=15)
+        resp.raise_for_status()
 
     def poll(self):
         resp = self.session.get(
@@ -253,12 +366,12 @@ class Alerter:
                     json={"chat_id": self.tg_chat, "text": line},
                     timeout=10,
                 )
-            except requests.RequestException as e:
+            except NET_ERRORS as e:
                 print(f"[warn] Telegram: {e}", file=sys.stderr)
         if self.webhook:
             try:
                 self.session.post(self.webhook, json=event.to_dict(), timeout=10)
-            except requests.RequestException as e:
+            except NET_ERRORS as e:
                 print(f"[warn] webhook: {e}", file=sys.stderr)
 
 
@@ -277,7 +390,9 @@ def save_state(path, seen):
     os.replace(tmp, path)
 
 
-def build_source(name, session):
+def build_source(name, session, espn_leagues):
+    if name == "espn":
+        return ESPNSource(session, espn_leagues)
     if name == "sofascore":
         return SofascoreSource(session)
     if name == "api-football":
@@ -288,10 +403,28 @@ def build_source(name, session):
     sys.exit(f"Неизвестный источник: {name}")
 
 
+def pick_auto_source(session, espn_leagues):
+    """espn → sofascore → api-football: первый, чей check() прошёл."""
+    candidates = [ESPNSource(session, espn_leagues), SofascoreSource(session)]
+    if os.environ.get("API_FOOTBALL_KEY"):
+        candidates.append(ApiFootballSource(session, os.environ["API_FOOTBALL_KEY"]))
+    for src in candidates:
+        try:
+            src.check()
+            return src
+        except NET_ERRORS as e:
+            print(f"[info] {src.name} недоступен ({e}), пробую следующий",
+                  file=sys.stderr)
+    sys.exit("Ни один источник не доступен. Для Sofascore поставьте curl_cffi "
+             "(pip install curl_cffi); для api-football задайте API_FOOTBALL_KEY.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Live-монитор пенальти")
-    ap.add_argument("--source", choices=["sofascore", "api-football", "auto"],
-                    default="auto", help="источник данных (auto: sofascore, при 403 — api-football)")
+    ap.add_argument("--source", choices=["espn", "sofascore", "api-football", "auto"],
+                    default="auto", help="источник данных (auto: espn → sofascore → api-football)")
+    ap.add_argument("--espn-leagues", default=",".join(ESPNSource.DEFAULT_LEAGUES),
+                    help="лиги ESPN через запятую (eng.2 = Championship, eng.3 = League One...)")
     ap.add_argument("--interval", type=int, default=20, help="интервал опроса, сек (default 20)")
     ap.add_argument("--once", action="store_true", help="один проход и выход (проверка доступности)")
     ap.add_argument("--state-file", default="penalty_state.json",
@@ -301,19 +434,15 @@ def main():
                     help="алертить и старые события первого прохода (по умолчанию первый проход только заполняет state)")
     args = ap.parse_args()
 
-    session = requests.Session()
+    session = make_session()
+    print(f"[info] TLS-имитация Chrome: {'да (curl_cffi)' if HAVE_CURL_CFFI else 'нет — pip install curl_cffi для Sofascore/Flashscore'}",
+          file=sys.stderr)
+
+    espn_leagues = [x.strip() for x in args.espn_leagues.split(",") if x.strip()]
     if args.source == "auto":
-        source = SofascoreSource(session)
-        try:
-            source._get("/sport/football/events/live")
-        except requests.RequestException:
-            if os.environ.get("API_FOOTBALL_KEY"):
-                print("[info] Sofascore недоступен, переключаюсь на api-football", file=sys.stderr)
-                source = ApiFootballSource(session, os.environ["API_FOOTBALL_KEY"])
-            else:
-                sys.exit("Sofascore недоступен (403/сеть), а API_FOOTBALL_KEY не задан.")
+        source = pick_auto_source(session, espn_leagues)
     else:
-        source = build_source(args.source, session)
+        source = build_source(args.source, session, espn_leagues)
 
     alerter = Alerter(session, args.jsonl)
     seen = load_state(args.state_file)
@@ -329,7 +458,7 @@ def main():
     while not stop["flag"]:
         try:
             events = source.poll()
-        except requests.RequestException as e:
+        except NET_ERRORS as e:
             print(f"[warn] опрос не удался: {e}", file=sys.stderr)
             events = []
         fresh = [ev for ev in events if ev.key not in seen]
@@ -345,7 +474,7 @@ def main():
                   f"занесено в state без алертов", file=sys.stderr)
             first_pass = False
         if args.once:
-            print(f"[info] --once: найдено пенальти-событий в live-матчах: {len(events)}",
+            print(f"[info] --once: найдено пенальти-событий: {len(events)}",
                   file=sys.stderr)
             break
         for _ in range(args.interval):
