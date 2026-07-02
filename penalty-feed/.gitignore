@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+penalty_state.json
+penalties.jsonl
