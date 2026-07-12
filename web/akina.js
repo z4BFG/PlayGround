@@ -335,3 +335,22 @@ function animate() {
   renderer.render(scene, camera);
 }
 animate();
+
+// ------------------------------------------------------- debug / capture hook
+// Lets tooling (e.g. headless screenshots) park the car and frame any angle.
+window.__akina = {
+  THREE, scene, camera, controls, car, centers, tangents, rights,
+  setT(v) { t = Math.max(0, Math.min(centers.length - 2, v)); driving = false; placeCar(); },
+  drive(b) { driving = !!b; },
+  look(camPos, target) {
+    driving = false;
+    camera.position.set(camPos[0], camPos[1], camPos[2]);
+    controls.target.set(target[0], target[1], target[2]);
+    controls.update();
+  },
+  bbox() {
+    const b = new THREE.Box3().setFromPoints(centers);
+    return { min: b.min.toArray(), max: b.max.toArray(),
+             center: b.getCenter(new V3()).toArray(), size: b.getSize(new V3()).toArray() };
+  },
+};
